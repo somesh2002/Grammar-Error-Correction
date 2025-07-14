@@ -4,7 +4,8 @@ import torch
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field,asdict
-from transformers import T5Tokenizer, T5ForConditionalGeneration, TrainingArguments, Trainer
+from transformers import BartTokenizer, BartForConditionalGeneration
+from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
 from tqdm import tqdm
 from datasets import Dataset
@@ -12,7 +13,72 @@ import pandas as pd
 import json
 from sklearn.model_selection import train_test_split
 import sacrebleu
+from sklearn.metrics import accuracy_score
 from peft import PeftModel
+
+def compute_sacrebleu_and_exact(preds, labels):
+    preds = [p.strip() for p in preds]
+    labels = [l.strip() for l in labels]
+    
+    bleu = sacrebleu.corpus_bleu(preds, [labels])
+    exact_match = sum(p == l for p, l in zip(preds, labels)) / len(labels)
+    
+    return {
+        "bleu": bleu.score,
+        "exact_match": exact_match
+    }
+
+def decode_dataset(model, tokenizer, dataset, device, max_length=128, batch_size=16):
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    sources = dataset["source"]
+    targets = dataset["target"]
+
+    for i in tqdm(range(0, len(sources), batch_size), desc="Evaluating"):
+        batch_sources = sources[i:i+batch_size]
+        batch_targets = targets[i:i+batch_size]
+
+        inputs = tokenizer(
+            batch_sources,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_length=max_length,
+                num_beams=5
+            )
+
+        decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        all_preds.extend(decoded_preds)
+        all_labels.extend(batch_targets)
+
+    return all_preds, all_labels
+
+def evaluate_bleu_and_exact(model, tokenizer, train_dataset, val_dataset, device="cuda", max_length=128):
+    logger.info(" Evaluating training set...")
+    train_preds, train_labels = decode_dataset(model, tokenizer, train_dataset, device, max_length)
+    train_metrics = compute_sacrebleu_and_exact(train_preds, train_labels)
+
+    logger.info(" Evaluating validation set...")
+    val_preds, val_labels = decode_dataset(model, tokenizer, val_dataset, device, max_length)
+    val_metrics = compute_sacrebleu_and_exact(val_preds, val_labels)
+
+    print("\n Final Evaluation Metrics:")
+    print(f"Train BLEU: {train_metrics['bleu']:.2f} | Train Exact Match: {train_metrics['exact_match']*100:.2f}%")
+    print(f"Val   BLEU: {val_metrics['bleu']:.2f} | Val   Exact Match: {val_metrics['exact_match']*100:.2f}%")
+
+    return {
+        "train": train_metrics,
+        "val": val_metrics
+    }
 
 
 logging.basicConfig(
@@ -23,17 +89,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GECConfig:
+    # Directory paths
     output_dir: str = "./save_model"
     cache_dir: str = "./cache"
     logging_dir: str = "./logs"
+
+    # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_name_or_path: str = "t5-base"  # or "facebook/bart-large"
+    # Training hyperparameters
+    model_name_or_path: str = "facebook/bart-large"  # or "facebook/bart-large"
     max_target_length: int = 128
     num_train_epochs: int = 7
     batch_size: int = 32
     learning_rate: float = 3e-4
 
+    # Evaluation
     metric_for_best_model: str = "loss"
     load_best_model_at_end: bool = True
     save_total_limit: int = 2
@@ -41,11 +112,12 @@ class GECConfig:
     optim: str = "adamw_torch"
     lr_scheduler_type: str = "cosine"
 
+    # LoRA-specific
     use_lora: bool = True
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.1
-    lora_target_modules: list = field(default_factory=lambda: ["q", "v"])
+    lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
     lora_bias: str = "none"
     lora_task_type: str = "SEQ_2_SEQ_LM"
     batch_correct_batch_size: int = 32
@@ -53,6 +125,7 @@ class GECConfig:
 
 
     def to_json(self, save_path: str):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "w") as f:
             json.dump(asdict(self), f, indent=4)
         print(f"Config saved to {save_path}")
@@ -157,14 +230,14 @@ class M2Parser:
         return corrected_sentence
  
 class GECorrector:
-    """GEC system using the T5 model."""
+    """GEC system using the BART model."""
 
     def __init__(self, config: GECConfig, model_path: Optional[str] = None):
         self.config = config
         self.device = torch.device(config.device)
         base_model_path = model_path if model_path else config.model_name_or_path
-        self.tokenizer = T5Tokenizer.from_pretrained(base_model_path)
-        base_model = T5ForConditionalGeneration.from_pretrained(base_model_path)
+        self.tokenizer = BartTokenizer.from_pretrained("facebook/bart-large")
+        base_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large")
         if model_path:
             self.model = PeftModel.from_pretrained(base_model, model_path)
         else:
@@ -297,8 +370,6 @@ class GECorrector:
         os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
-        config_path = os.path.join(path, "config.json")
-        self.config.to_json(config_path)
         print(f"Model, tokenizer, and config saved to {path}")
 
     @classmethod
@@ -312,12 +383,13 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true", help="Train the model")
     parser.add_argument("--m2_file", type=str, help="Path to M2 file for training")
     parser.add_argument("--correct", action="store_true", help="Correct sentences")
+    parser.add_argument("--evaluate", action="store_true", help="Metric Calculation")
     parser.add_argument("--output_file", type=str, help="Path to output file")
     parser.add_argument("--model_path", type=str, default="./t5_lora_gec", help="Path to save/load model")
     args = parser.parse_args()
 
     config = GECConfig()
-    config = GECConfig.from_json(args.model_path)
+    # config = GECConfig.from_json(args.model_path)
     print(config)
     if args.train and args.m2_file:
         corrector = GECorrector(config)
@@ -327,6 +399,17 @@ if __name__ == "__main__":
     else:
         corrector = GECorrector.load(args.model_path, config)
         print("Model loaded successfully")
+    if args.evaluate and args.m2_file:
+        print("Evaluating the model")
+        # Load the model and tokenizer
+        # Load the M2 file and prepare the dataset
+        corrector = GECorrector(config)
+        corrector = GECorrector.load(args.model_path, config)
+        train_dataset, val_dataset = corrector.load_and_prepare_data(args.m2_file)
+        metrics = evaluate_bleu_and_exact(corrector.model, corrector.tokenizer, train_dataset, val_dataset, device=config.device)
+        print(metrics)
+
+
 
     if args.correct and args.output_file:
         output_file = args.output_file
