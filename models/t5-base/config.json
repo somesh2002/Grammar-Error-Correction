@@ -1,0 +1,28 @@
+{
+    "output_dir": "./t5_lora_gec",
+    "cache_dir": "./cache",
+    "logging_dir": "./logs",
+    "device": "cuda",
+    "model_name_or_path": "t5-base",
+    "max_target_length": 128,
+    "num_train_epochs": 15,
+    "batch_size": 32,
+    "learning_rate": 0.0003,
+    "metric_for_best_model": "loss",
+    "load_best_model_at_end": true,
+    "save_total_limit": 2,
+    "logging_steps": 10,
+    "optim": "adamw_torch",
+    "lr_scheduler_type": "cosine",
+    "use_lora": true,
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.1,
+    "lora_target_modules": [
+        "q",
+        "v"
+    ],
+    "lora_bias": "none",
+    "lora_task_type": "SEQ_2_SEQ_LM",
+    "batch_correct_batch_size": 32
+}
