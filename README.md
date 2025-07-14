@@ -35,6 +35,7 @@ Output: It has an interesting past .
 ### Negative Outputs
 
 Input: The entery will be free . 
+
 Output: The enterance will be free . 
 
 
@@ -54,7 +55,7 @@ Overview:
 conda env create -f environment.yml
 source activate t5-lora-env
 
-## 🧪 Running the Code
+## Running the Code
 Run the test script and train script
 Train Data: Format of m2.
 Model path: Path to folder
